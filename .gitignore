@@ -15,3 +15,7 @@
 **/*.pyc
 **/.DS_Store
 **/.runtime/
+# Herdr regenerates these editor helpers for the installed app version.
+mods/*/gpui-kit.d.ts
+mods/*/herdr.d.ts
+mods/*/jsconfig.json

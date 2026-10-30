@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Classic Herdr -> Herdr desktop. Python 3.10+, standard library only.
 
-No credentials, scrollback, telemetry, network requests, or process termination.
+No credentials, scrollback, telemetry, network requests, or agent termination.
 Only local core/app APIs and explicitly selected session files are used.
 """
 import argparse
