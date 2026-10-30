@@ -51,6 +51,8 @@ Buttons darken or fade slightly on hover. The arc uses native `.spin(1000)`, nev
 
 Ship one folder with `mods/herdr-migration/`, `keys.json`, this recipe and `preview.png`. Do not ship `layouts/`.
 
+The main install flow is one request to the person's Herdr agent: `Read ~/.config/herdr-app/AGENTS.md, then add and open this mod: github.com/CiprianSpiridon/herdr-migration`. The agent reads the recipe and every mod file, copies the mod folder, merges only available shortcuts, runs the check and opens the wizard. Copying the mod folder is sufficient; `install.py` is an optional convenience for manual installation. Python 3.10 or newer is still required for the backend.
+
 - `main.js`: a `View` from `gpui-kit`; chained `div`, `h_flex`, `v_flex`, `InputState`/`Input` from `gpui-base`. Its node tree is a column containing the header, step row, flexible page body and notice. It uses `theme`, `appHome`, `home`, `exec`, `pickFolder`, `props`, `closeOverlay`, `run` and `nextCommand` from `herdr`. No shipped mod is required. Optional `props.source` sets the initial source path for embeddings; normal use needs no props.
 - `mod.json`: `place: "none"`; overlay width 900, height 720. Open with `mod.open {name: "herdr-migration"}`. No layout is installed.
 - `spinner.svg`: a 24px open circular arc, one color, tinted by the theme and rotated natively. The arrow and checkbox check are text.

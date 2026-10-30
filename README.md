@@ -13,9 +13,24 @@ Your agents keep running in classic Herdr while you move. When you're ready, exi
 
 *The screenshot shows the real native mod with sample projects in an isolated Herdr session.*
 
-## Get started
+## Install
 
-You need [Herdr desktop and herdr-core](https://herdr.dev/), Python 3.10 or newer, and a classic Herdr session on the same computer.
+Paste this into an agent running in Herdr:
+
+```text
+Read ~/.config/herdr-app/AGENTS.md, then add and open this mod: github.com/CiprianSpiridon/herdr-migration
+```
+
+Your agent reads [RECIPE.md](RECIPE.md) and the mod's files, copies `mods/herdr-migration/` into your Herdr app folder, merges the available shortcuts, checks the mod and opens the wizard. It keeps your existing layout and key bindings.
+
+After installation, open it with **⌘⇧M** on macOS or **Ctrl+Shift+M** on Linux and Windows.
+
+You need [Herdr desktop and herdr-core](https://herdr.dev/), Python 3.10 or newer, and a classic Herdr session on the same computer. The mod detects `python3`, `python` or the Windows Python launcher.
+
+<details>
+<summary>Install manually</summary>
+
+The optional installer checks the mod, preserves existing files and adds available shortcuts:
 
 ```sh
 git clone https://github.com/CiprianSpiridon/herdr-migration.git
@@ -26,11 +41,9 @@ herdr-app do mod.open --name herdr-migration
 
 On Windows, use `py -3 install.py` if Python is installed through the Python launcher.
 
-The installer checks the mod, keeps existing key bindings and adds the available shortcuts. Open the wizard with **⌘⇧M** on macOS or **Ctrl+Shift+M** on Linux and Windows. It lives in a dialog, so you can keep your current layout.
+If a shortcut is already in use, it stays yours. Open the mod through Herdr's command palette or the `mod.open` command instead.
 
-Prefer asking your coding agent?
-
-> Read `~/.config/herdr-app/AGENTS.md`, then install the `herdr-migration` mod from https://github.com/CiprianSpiridon/herdr-migration. Read `RECIPE.md` and every mod file first, preserve my existing key bindings, run the mod check, and open the migration wizard.
+</details>
 
 ## Four steps, with a clear stopping point
 
