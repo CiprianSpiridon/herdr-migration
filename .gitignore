@@ -1,0 +1,17 @@
+# This directory also contains private evidence from a one-off migration.
+# Only the reusable package below is eligible for publication.
+/*
+!/.gitignore
+!/README.md
+!/RECIPE.md
+!/LICENSE
+!/preview.png
+!/keys.json
+!/install.py
+!/mods/
+!/tests/
+!/.github/
+**/__pycache__/
+**/*.pyc
+**/.DS_Store
+**/.runtime/

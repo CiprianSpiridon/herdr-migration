@@ -1,0 +1,6 @@
+{
+  "global": {
+    "cmd-shift-m": "mod.open:herdr-migration",
+    "ctrl-shift-m": "mod.open:herdr-migration"
+  }
+}
