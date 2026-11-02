@@ -19,13 +19,40 @@ import threading
 import time
 import uuid
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MAX_BYTES = 16 * 1024 * 1024
 SHELLS = {"zsh", "bash", "fish", "sh", "dash", "nu", "pwsh", "powershell", "cmd", "xonsh"}
+AGENTS = {"claude": "Claude", "codex": "Codex", "grok": "Grok"}
+# How long a resumed agent has to appear in its new tab. Herdr's exec limit is 30 s.
+LAUNCH_SECONDS = 8
+LAUNCH_POLL = 0.25
 
 
 class MigrationError(Exception):
     pass
+
+
+def program_names(foreground):
+    """Basenames that identify a foreground program, including one started by an interpreter."""
+    foreground = foreground or {}
+    argv = [Path(str(a)).name for a in (foreground.get("argv") or [])[:2]]
+    return [n for n in argv + [Path(str(foreground.get("name") or "")).name] if n]
+
+
+def running_agent(terminal):
+    """True while an agent reports a status in this terminal or is its foreground program.
+
+    Claude's process name is its version (for example 2.1.316), so argv is checked too.
+    """
+    if terminal.get("status"):
+        return True
+    return any(name == agent or name.startswith((agent + "-", agent + "."))
+               for name in program_names(terminal.get("foreground")) for agent in AGENTS)
+
+
+def describe(foreground):
+    argv = [Path(str(a)).name for a in ((foreground or {}).get("argv") or [])[:3]]
+    return " ".join(argv) or Path(str((foreground or {}).get("name") or "")).name or "another program"
 
 
 def read_json(path, default=None):
@@ -524,6 +551,17 @@ class Engine:
         write_json(run_dir / "receipt.json", {"workspaces": len(chosen), "tabs": sum(len(w["tabs"]) for w in chosen),
                                               "panes": job["total"], "verified": True, "backup": str(backup), "created": time.time()})
 
+    def claude_sessions(self):
+        """Live Claude Code sessions by ID: interactive ones and background ones.
+
+        Exiting Claude with "Move to background and exit" closes the pane but keeps
+        the conversation running, so classic Herdr's agent list no longer shows it.
+        """
+        sessions = self.runtime.cli(["claude", "agents", "--json"])
+        if not isinstance(sessions, list):
+            raise MigrationError("Unexpected response from claude agents.")
+        return {s["sessionId"]: s for s in sessions if isinstance(s, dict) and s.get("sessionId")}
+
     def status(self):
         state = self.store.read()
         job = state.get("job")
@@ -540,6 +578,7 @@ class Engine:
                 available = True
             except (MigrationError, KeyError):
                 pass
+        claude = None  # Checked once, only when a Claude row could otherwise be resumed.
         for workspace in plan.get("workspaces", []):
             target = history.get(workspace["id"], {})
             for tab in target.get("tabs", []):
@@ -549,10 +588,23 @@ class Engine:
                         continue
                     active = next((a for a in live_agents if a["pane_id"] == agent["classic_pane"] or
                                    (agent.get("session") and a.get("agent_session", {}).get("value") == agent["session"])), None)
+                    status = "resumed" if pane.get("resumed") else active.get("agent_status", "unknown") if active else "ready" if available else "unavailable"
+                    if status == "ready" and agent["agent"] == "claude" and agent.get("session"):
+                        if claude is None:
+                            try:
+                                claude = self.claude_sessions()
+                            except MigrationError:
+                                claude = False
+                        if claude is False:
+                            status = "unchecked"
+                        elif agent["session"] in claude:
+                            status = "background" if claude[agent["session"]].get("kind") == "background" else "elsewhere"
+                    # A late start in the failed tab looks like "elsewhere"; Resume adopts it.
+                    if status in ["ready", "elsewhere"] and pane.get("failed_launch"):
+                        status = "failed"
                     transfers.append({**agent, "workspace": workspace["name"], "terminal": pane["terminal"],
-                                      "space": target["space"], "tab": tab["id"],
-                                      "status": "resumed" if pane.get("resumed") else active.get("agent_status", "unknown") if active else "ready" if available else "unavailable",
-                                      "ready": available and active is None and not pane.get("resumed")})
+                                      "space": target["space"], "tab": tab["id"], "status": status,
+                                      "ready": status in ["ready", "failed"]})
         return {"job": job, "transfers": transfers, "legacy_available": available}
 
     def retry(self):
@@ -590,31 +642,91 @@ class Engine:
             if pane.get("resumed"):
                 raise MigrationError("This conversation has already been resumed here.")
             agent = pane["agent"]
+            sid, kind = agent.get("session"), agent["agent"]
+            location = next((w for w in state["sources"][plan["source_key"]]["workspaces"].values() if any(p is pane for t in w["tabs"] for p in t["panes"].values())), None)
+            failed = pane.get("failed_launch")
+            if failed and running_agent(self.terminal(failed["terminal"]) or {}):
+                # The previous launch started after we stopped waiting: adopt it, never start a second copy.
+                pane["resumed"] = {k: failed[k] for k in ["terminal", "tab", "at"]}
+                pane.pop("failed_launch")
+                self.store.write(state)
+                return {"message": "This conversation already started in its Resume tab.", "space": location["space"],
+                        "terminal": failed["terminal"], "tab": failed["tab"]}
             live = self.runtime.cli(plan["legacy_prefix"] + ["agent", "list"])["result"]["agents"]
-            if any(a["pane_id"] == agent["classic_pane"] or (agent.get("session") and a.get("agent_session", {}).get("value") == agent["session"]) for a in live):
+            if any(a["pane_id"] == agent["classic_pane"] or (sid and a.get("agent_session", {}).get("value") == sid) for a in live):
                 raise MigrationError("This conversation is still open in classic Herdr. Exit that agent first; your conversation stays saved.")
             actual = self.runtime.rpc("terminal.get", {"terminal": terminal_id})
-            name = Path((actual.get("foreground") or {}).get("name", "")).stem.lstrip("-")
-            if actual.get("state") != "live" or actual.get("status") or name not in SHELLS:
-                raise MigrationError("The destination terminal is busy. Return it to an empty shell before resuming.")
-            sid, kind = agent.get("session"), agent["agent"]
-            if sid and kind in ["claude", "codex", "grok"]:
-                argv = ["codex", "--no-daemon", "resume", sid] if kind == "codex" else [kind, "--resume", sid]
-            elif kind in ["claude", "codex", "grok"]:
-                argv = ["codex", "--no-daemon", "resume"] if kind == "codex" else [kind, "--resume"]
-            else:
+            if actual.get("state") != "live":
+                raise MigrationError("The imported terminal is no longer running. Open a shell in that pane before resuming.")
+            # Resume opens its own tab, so any shell (including one wrapped by a recorder
+            # or multiplexer) is fine here. Only an agent already running would duplicate it.
+            if running_agent(actual):
+                raise MigrationError("The destination terminal is busy running an agent. Exit it there first so the conversation doesn't run twice.")
+            if kind not in AGENTS:
                 raise MigrationError("This agent has no supported resume command. Start it manually in its migrated pane.")
+            if kind == "codex":
+                argv = ["codex", "--no-daemon", "resume"] + ([sid] if sid else [])
+            else:
+                argv = [kind, "--resume"] + ([sid] if sid else [])
             if not shutil.which(argv[0]):
                 raise MigrationError(f"Install {argv[0]} before resuming this conversation.")
+            if kind == "claude" and sid:
+                try:
+                    running = self.claude_sessions().get(sid)
+                except MigrationError as error:
+                    raise MigrationError(f"Cannot check Claude's own sessions with claude agents --json ({error}). "
+                                         "Update Claude Code, then retry.") from error
+                if running and running.get("kind") == "background":
+                    raise MigrationError("This conversation is still running as a Claude background session. "
+                                         "Stop it in claude agents once it has finished, then resume here.")
+                if running:
+                    raise MigrationError("This conversation is still open in another Claude session. Exit it there first; your conversation stays saved.")
             # Start the native agent in its own new tab, with argv instead of shell
             # text. No command is injected into a potentially edited shell prompt.
-            location = next((w for w in state["sources"][plan["source_key"]]["workspaces"].values() if any(p is pane for t in w["tabs"] for p in t["panes"].values())), None)
             result = self.runtime.app("tab.new", {"space": location["space"], "folder": pane["folder"], "name": "Resume " + kind, "argv": argv})
-            pane["resumed"] = {"terminal": result["terminal"], "tab": result["tab"], "at": time.time()}
+            launch = {"terminal": result["terminal"], "tab": result["tab"], "at": time.time()}
+            # Journal before waiting: an interrupted check must never allow a second launch.
+            pane["resumed"] = launch
+            pane.pop("failed_launch", None)
             self.store.write(state)
+            started, seen = self.await_launch(result["terminal"])
+            if not started:
+                pane.pop("resumed")
+                pane["failed_launch"] = dict(launch, seen=seen)
+                self.store.write(state)
+                name = AGENTS[kind]
+                if seen and Path(seen.split()[0]).stem.lstrip("-") not in SHELLS:
+                    raise MigrationError(f"{name} did not start in its new tab: {seen} took over the shell first. A shell profile that wraps "
+                                         "or replaces interactive shells (a terminal recorder, tmux, exec) does this; see the README. "
+                                         "The tab is left open. Fix the profile, then choose Resume again.")
+                raise MigrationError(f"{name} did not start or keep running in its new tab. The tab is left open; check it for an error, "
+                                     "then choose Resume again.")
             return {"message": "Complete any sign-in or trust prompt in the agent's tab." if sid else "Choose your conversation in the agent's resume picker.", "space": location["space"], **result}
         finally:
             self.store.release(lock)
+
+    def terminal(self, address):
+        try:
+            return self.runtime.rpc("terminal.get", {"terminal": address})
+        except MigrationError:
+            return None
+
+    def await_launch(self, address):
+        """Wait until the new tab runs its agent. Opening the tab alone proves nothing:
+        a shell profile can replace the shell before the agent's argv runs."""
+        deadline = time.monotonic() + LAUNCH_SECONDS
+        seen = ""
+        while True:
+            actual = self.terminal(address)
+            if actual:
+                if running_agent(actual):
+                    return True, ""
+                seen = describe(actual.get("foreground"))
+                if actual.get("state") != "live":
+                    return False, seen
+            if time.monotonic() >= deadline:
+                return False, seen
+            time.sleep(LAUNCH_POLL)
 
     def pause(self):
         job = self.store.read().get("job")
@@ -641,6 +753,9 @@ def main():
     resume = sub.add_parser("resume")
     resume.add_argument("--terminal", required=True)
     args = parser.parse_args()
+    if sys.version_info < (3, 10):
+        print(json.dumps({"error": f"Python 3.10 or newer is required; {sys.executable} is {sys.version.split()[0]}."}))
+        return 1
     engine = Engine(args.app_home, args.data_dir)
     try:
         if args.command == "scan":

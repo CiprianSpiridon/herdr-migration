@@ -25,7 +25,7 @@ Your agent reads [RECIPE.md](RECIPE.md) and the mod's files, copies `mods/herdr-
 
 After installation, open it with **⌘⇧M** on macOS or **Ctrl+Shift+M** on Linux and Windows.
 
-You need [Herdr desktop and herdr-core](https://herdr.dev/), Python 3.10 or newer, and a classic Herdr session on the same computer. The mod detects `python3`, `python` or the Windows Python launcher.
+You need [Herdr desktop and herdr-core](https://herdr.dev/), Python 3.10 or newer, and a classic Herdr session on the same computer. The mod uses the first Python 3.10+ it finds: `python3`, a versioned `python3.1x`, Homebrew's `python3`, `python` or the Windows Python launcher. An older `python3` earlier on `PATH`, such as macOS's 3.9, is skipped.
 
 <details>
 <summary>Install manually</summary>
@@ -53,7 +53,7 @@ If a shortcut is already in use, it stays yours. Open the mod through Herdr's co
 
 **3. Bring them over.** A local backup is saved before the first terminal is created. The import runs in the background, restores the split proportions and verifies the result. You can close the dialog or pause the import and continue later.
 
-**4. Continue working.** Open the imported spaces. When an agent is no longer open in classic Herdr, resume its conversation from the wizard. If its exact session ID is unavailable, its own resume picker lets you choose.
+**4. Continue working.** Open the imported spaces. When an agent is no longer open in classic Herdr, resume its conversation from the wizard, or use **Resume all ready** to resume every available one in turn. If its exact session ID is unavailable, its own resume picker lets you choose.
 
 ## What comes with you
 
@@ -86,7 +86,24 @@ The completion screen shows the exact backup location. Backups include the class
 
 The mod runs the installed `herdr`, `herdr-app` and `hc` commands through a small Python helper. It reads the selected classic session and app configuration, then writes private migration history and backups. It does not read credential stores or terminal scrollback, send telemetry, or make HTTP requests.
 
-Conversation resumes are checked again at the moment you click: the old session must be closed and the destination must be an available shell. The agent opens in a new tab with its native arguments. Complete any sign-in, trust or approval prompt there yourself.
+Conversation resumes are checked again at the moment you click. The old session must be closed in classic Herdr. For Claude, the session also must not appear in `claude agents`, which includes conversations moved to the background on exit. No agent may already be running in the imported terminal. The agent opens in a new tab with its native arguments. The wizard waits for the agent to appear there and shows **Launch failed** if it doesn't. Complete any sign-in, trust or approval prompt in that tab yourself.
+
+## If a resume doesn't start
+
+**Claude's "Move to background and exit".** If you exit a Claude that still has background work, the pane closes but the conversation keeps running as a Claude background session. Its row shows *Running as a Claude background session* and has no Resume button. Stop it in `claude agents` once it has finished, and the button appears.
+
+**Shell profiles that take over new shells.** The agent starts through your interactive shell, so it loads your profile first. If `~/.zshrc` or `~/.bashrc` wraps every interactive shell in another program, that program takes over the tab before the agent can run. Examples are a terminal recorder (`bsc init zsh --auto-record`), an auto-started `tmux` or `zellij`, or `exec fish`. The row shows **Launch failed** and the tab is left open so you can see what took over. To fix it, start the wrapper only when the shell isn't running a command:
+
+```zsh
+# ~/.zshrc: wrap interactive shells, not `zsh -ic <command>` launches
+if [[ -z "$ZSH_EXECUTION_STRING" ]]; then
+  eval "$(bsc init zsh --auto-record)"
+else
+  eval "$(bsc init zsh)"
+fi
+```
+
+In bash, test `$BASH_EXECUTION_STRING` the same way. Then choose **Resume again**. If the agent did start after the wizard stopped waiting, Resume opens that tab instead of starting a second copy.
 
 ## Rebuild it, change it, share it
 

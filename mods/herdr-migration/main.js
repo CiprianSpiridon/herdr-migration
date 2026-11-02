@@ -6,6 +6,21 @@ const STEP = ["Find your work", "Choose workspaces", "Bring them over", "Continu
 const basename = path => (path ?? "").replace(/\\/g, "/").split("/").filter(Boolean).pop() || "Home";
 const count = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 const shortPath = path => (path ?? "").startsWith(home()) ? `~${path.slice(home().length)}` : path;
+// The first python3 on PATH can be too old (macOS ships 3.9), so probe versioned and Homebrew ones too.
+const PYTHONS = [["python3"], ["python3.14"], ["python3.13"], ["python3.12"], ["python3.11"], ["python3.10"],
+  ["/opt/homebrew/bin/python3"], ["/usr/local/bin/python3"], ["python"], ["py", "-3"]];
+const NEEDS_PYTHON = "Install Python 3.10 or newer, then reopen this window.";
+const LABELS = {
+  working: "Working in classic", blocked: "Needs you in classic", done: "Done in classic", idle: "Open in classic", unknown: "Open in classic",
+  ready: "Ready to resume", resumed: "Resumed", unavailable: "Classic status unavailable",
+  background: "Running as a Claude background session", elsewhere: "Open in another Claude session",
+  unchecked: "Can't check Claude's sessions", failed: "Launch failed",
+};
+const DETAILS = {
+  background: "Stop it in claude agents once it finishes. Resume appears here after that.",
+  unchecked: "Install or update Claude Code so claude agents --json works.",
+  failed: "The agent didn't start in its new tab. If your shell profile wraps new shells, see the README, then Resume again.",
+};
 
 export default class HerdrMigration extends View {
   init(_props, cx) {
@@ -43,20 +58,23 @@ export default class HerdrMigration extends View {
 
   backend() { return `${appHome()}/mods/herdr-migration/backend.py`; }
 
-  async call(command, args = []) {
-    let result;
-    const candidates = this.python ? [this.python] : [["python3"], ["python"], ["py", "-3"]];
-    for (const candidate of candidates) {
+  async interpreter() {
+    if (this.python) return this.python;
+    for (const candidate of PYTHONS) {
       try {
-        result = await exec(candidate[0], [...candidate.slice(1), this.backend(), "--app-home", appHome(), command, ...args]);
-        this.python = candidate;
-        break;
-      } catch (error) { if (this.python) throw error; }
+        const probe = await exec(candidate[0], [...candidate.slice(1), "-c", "import sys; print(sys.version_info >= (3, 10))"]);
+        if (probe.code === 0 && probe.stdout.trim() === "True") return (this.python = candidate);
+      } catch { /* Not installed under this name. */ }
     }
-    if (!result) throw new Error("Install Python 3.10 or newer, then reopen this window.");
+    throw new Error(NEEDS_PYTHON);
+  }
+
+  async call(command, args = []) {
+    const python = await this.interpreter();
+    const result = await exec(python[0], [...python.slice(1), this.backend(), "--app-home", appHome(), command, ...args]);
     let data;
     try { data = JSON.parse(result.stdout); }
-    catch { throw new Error(result.stderr || "Python 3.10 or newer is required. Install Python and reopen this window."); }
+    catch { throw new Error(result.stderr || NEEDS_PYTHON); }
     if (result.code !== 0 || data.error) throw new Error(data.error || result.stderr || "The operation failed.");
     return data;
   }
@@ -138,8 +156,37 @@ export default class HerdrMigration extends View {
           return;
         }
         this.refresh(cx);
-      } catch (error) { this.error = String(error).replace(/^Error: /, ""); }
+      } catch (error) {
+        this.error = String(error).replace(/^Error: /, "");
+        if (command === "resume") this.refresh(cx);  // Show Launch failed on its row.
+      }
       this.busy = false;
+      cx.notify();
+    });
+  }
+
+  // One at a time: each resume re-checks the old session and waits for its agent to start.
+  // Stops at the first refusal or failed launch, which usually needs a fix before the rest.
+  resumeAll(cx) {
+    const ready = this.transfers.filter(agent => agent.ready);
+    if (this.busy || !ready.length) return;
+    this.busy = true;
+    this.error = "";
+    cx.notify();
+    cx.spawn(async cx => {
+      let resumed = 0;
+      for (const agent of ready) {
+        this.notice = `Resuming ${resumed + 1} of ${ready.length}: ${agent.workspace}…`;
+        cx.notify();
+        try { await this.call("resume", ["--terminal", agent.terminal]); resumed++; }
+        catch (error) {
+          this.error = `Resumed ${resumed} of ${ready.length}. ${agent.workspace}: ${String(error).replace(/^Error: /, "")}`;
+          break;
+        }
+      }
+      this.notice = this.error ? "" : `Resumed ${count(resumed, "conversation")}, each in its own tab. Complete any sign-in or trust prompt there.`;
+      this.busy = false;
+      this.refresh(cx);
       cx.notify();
     });
   }
@@ -253,24 +300,27 @@ export default class HerdrMigration extends View {
 
   completePage() {
     const t = theme();
+    const ready = this.transfers.filter(agent => agent.ready).length;
     return v_flex().gap(13).flex_1().min_h(0)
       .child(this.title("Your workspaces are ready", "Folders and split layouts are verified. Your existing app spaces are preserved."))
       .child(h_flex().p(13).gap(10).items_center().rounded(9).bg(t.surface)
         .child(this.badge("Verified", t.done))
         .child(div().text_size(12).text_color(t.muted).child(`${this.job?.total ?? 0} terminals imported · backup saved`)))
-      .child(div().text_size(13).font_semibold().child("Continue your conversations"))
-      .child(div().text_size(11.5).text_color(t.muted).child("When an old agent is ready, exit it in classic Herdr. Then resume its conversation here. This mod never stops an agent or answers an approval for you."))
+      .child(h_flex().items_center().justify_between()
+        .child(div().text_size(13).font_semibold().child("Continue your conversations"))
+        .when(ready > 1, el => el.child(this.button("resume-all", this.busy ? "Resuming…" : `Resume all ready (${ready})`, (_e, cx) => this.resumeAll(cx), false, !this.busy))))
+      .child(div().text_size(11.5).text_color(t.muted).child("When an old agent is ready, exit it in classic Herdr. Then resume its conversation here. If Claude moves it to the background, it keeps running until you stop it in claude agents. This mod never stops an agent or answers an approval for you."))
       .child(v_flex().id("conversation-list").flex_1().min_h(60).overflow_y_scrollbar().gap(8)
         .when(!this.transfers.length, el => el.child(div().p(16).rounded(9).bg(t.surface).text_size(12).text_color(t.muted).child("No saved agents were found in this selection. Your terminal shells are ready to use.")))
         .children(this.transfers.map((agent, i) => {
-          const color = agent.status === "working" ? t.working : agent.status === "blocked" ? t.blocked : agent.status === "done" || agent.status === "resumed" ? t.done : t.muted;
-          const label = { working: "Working in classic", blocked: "Needs you in classic", done: "Done in classic", idle: "Open in classic", unknown: "Open in classic", ready: "Ready to resume", resumed: "Resumed", unavailable: "Classic status unavailable" }[agent.status] ?? "Open in classic";
+          const color = agent.status === "working" || agent.status === "background" ? t.working : agent.status === "blocked" || agent.status === "failed" ? t.blocked : agent.status === "done" || agent.status === "resumed" ? t.done : t.muted;
+          const detail = DETAILS[agent.status] ?? (!agent.session && agent.status !== "resumed" ? "Choose the conversation in the agent's resume picker." : "");
           return h_flex().id(`transfer-${i}`).p(12).gap(10).items_center().rounded(9).bg(t.surface)
             .child(v_flex().flex_1().gap(5)
               .child(h_flex().gap(8).items_center().child(div().text_size(12.5).font_semibold().child(agent.workspace)).child(div().text_size(11.5).text_color(t.dim).child(agent.agent)))
-              .child(div().text_size(11).text_color(color).child(label))
-              .when(!agent.session, el => el.child(div().text_size(10.5).text_color(t.dim).child("Choose the conversation in the agent's resume picker."))))
-            .when(agent.ready, el => el.child(this.button(`resume-${i}`, "Resume", (_e, cx) => this.operation("resume", ["--terminal", agent.terminal], cx), true, !this.busy)));
+              .child(div().text_size(11).text_color(color).child(LABELS[agent.status] ?? "Open in classic"))
+              .when(Boolean(detail), el => el.child(div().text_size(10.5).text_color(t.dim).child(detail))))
+            .when(agent.ready, el => el.child(this.button(`resume-${i}`, agent.status === "failed" ? "Resume again" : "Resume", (_e, cx) => this.operation("resume", ["--terminal", agent.terminal], cx), true, !this.busy)));
         })))
       .when(Boolean(this.job?.backup), el => el.child(div().text_size(10.5).text_color(t.dim).child(`Backup: ${shortPath(this.job.backup)}`)))
       .child(h_flex().justify_between().gap(8)

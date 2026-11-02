@@ -22,8 +22,16 @@ class FakeRuntime:
         self.legacy = []
         self.crash_after_spawn = False
         self.conflict = False
+        self.claude = []
+        self.claude_error = None
+        self.hijack = False
+        self.resumes = 0
 
     def cli(self, args):
+        if args == ["claude", "agents", "--json"]:
+            if self.claude_error:
+                raise m.MigrationError(self.claude_error)
+            return copy.deepcopy(self.claude)
         if args[1:3] == ["session", "list"]:
             return {"sessions": [{"default": True, "running": True, "session_dir": str(self.source.parent)}]}
         if args[-2:] == ["api", "snapshot"]:
@@ -39,6 +47,8 @@ class FakeRuntime:
         if method == "terminal.list":
             return {"terminals": copy.deepcopy(list(self.terminals.values()))}
         if method == "terminal.get":
+            if params["terminal"] not in self.terminals:
+                raise m.MigrationError("Core not_found: no such terminal")
             return copy.deepcopy(self.terminals[params["terminal"]])
         if method == "terminal.run":
             address = "t" + str(len(self.terminals) + 1)
@@ -64,7 +74,14 @@ class FakeRuntime:
 
     def app(self, name, args):
         self.calls.append((name, args))
-        return {"terminal": "resumed", "tab": "resume-tab", "space": args["space"]}
+        self.resumes += 1
+        address = "r" + str(self.resumes)
+        # A profile wrapper such as `bsc rec && exit` takes over before the agent's argv runs.
+        foreground = {"name": "node", "argv": ["node", "/opt/homebrew/bin/bsc", "rec"]} if self.hijack else \
+            {"name": "2.1.316", "argv": args["argv"]}
+        self.terminals[address] = {"address": address, "state": "live", "cwd": args["folder"], "keep": False,
+                                   "labels": {}, "status": None, "foreground": dict(foreground, cwd=args["folder"])}
+        return {"terminal": address, "tab": "resume-tab-" + str(self.resumes), "space": args["space"]}
 
     def close(self):
         pass
@@ -88,6 +105,10 @@ class MigrationTests(unittest.TestCase):
         m.write_json(self.source, self.raw)
         self.runtime = FakeRuntime(self.source)
         self.engine = m.Engine(self.home, self.root / "data", self.runtime)
+        for patcher in [patch.object(m, "LAUNCH_SECONDS", 0.2), patch.object(m, "LAUNCH_POLL", 0.01),
+                        patch.object(m.shutil, "which", return_value="/installed/agent")]:
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -206,13 +227,95 @@ class MigrationTests(unittest.TestCase):
         self.engine.perform(self.engine.store.read(), plan)
         self.assertEqual(len(self.runtime.terminals), 2)
 
-    def test_busy_destination_is_never_sent_a_resume(self):
-        _, state = self.imported()
-        first = next(iter(self.runtime.terminals.values()))
-        first["foreground"]["name"] = "vim"
-        with self.assertRaisesRegex(m.MigrationError, "busy"):
-            self.engine.resume(first["address"])
-        self.assertFalse(any(name == "tab.new" for name, _ in self.runtime.calls))
+    def tab_launches(self):
+        return [args for name, args in self.runtime.calls if name == "tab.new"]
+
+    def transfer(self):
+        return next(t for t in self.engine.status()["transfers"] if t["terminal"] == "t1")
+
+    def test_agent_running_in_destination_is_never_sent_a_resume(self):
+        self.imported()
+        first = self.runtime.terminals["t1"]
+        # Claude's process name is its version; it may not have reported a status yet.
+        for status, foreground in [(None, {"name": "2.1.316", "argv": ["claude"]}),
+                                   ({"app": "claude-code", "state": "idle"}, {"name": "zsh", "argv": ["zsh"]})]:
+            first.update(status=status, foreground=foreground)
+            with self.assertRaisesRegex(m.MigrationError, "busy"):
+                self.engine.resume("t1")
+        self.assertFalse(self.tab_launches())
+
+    def test_wrapped_shell_destination_can_resume(self):
+        self.imported()
+        # A recorder started from ~/.zshrc (`bsc rec && exit`) is the foreground of every shell.
+        self.runtime.terminals["t1"]["foreground"] = {"name": "node", "argv": ["node", "/opt/homebrew/bin/bsc", "rec"]}
+        result = self.engine.resume("t1")
+        self.assertEqual(self.runtime.terminals[result["terminal"]]["foreground"]["argv"], ["claude", "--resume", "exact-conversation"])
+        self.assertEqual(self.transfer()["status"], "resumed")
+
+    def test_live_claude_background_session_blocks_resume(self):
+        self.imported()
+        self.runtime.claude = [{"id": "exact-co", "kind": "background", "sessionId": "exact-conversation", "state": "working"}]
+        self.assertEqual(self.transfer()["status"], "background")
+        self.assertFalse(self.transfer()["ready"])
+        with self.assertRaisesRegex(m.MigrationError, "background session"):
+            self.engine.resume("t1")
+        self.runtime.claude = [{"pid": 4242, "kind": "interactive", "sessionId": "exact-conversation", "status": "idle"}]
+        self.assertEqual(self.transfer()["status"], "elsewhere")
+        with self.assertRaisesRegex(m.MigrationError, "another Claude session"):
+            self.engine.resume("t1")
+        self.assertFalse(self.tab_launches())
+        self.runtime.claude = [{"pid": 4242, "kind": "interactive", "sessionId": "a-different-conversation"}]
+        self.assertTrue(self.transfer()["ready"])
+        self.engine.resume("t1")
+        self.assertEqual(len(self.tab_launches()), 1)
+
+    def test_unavailable_claude_session_check_refuses_resume(self):
+        self.imported()
+        self.runtime.claude_error = "unknown command agents"
+        self.assertEqual(self.transfer()["status"], "unchecked")
+        self.assertFalse(self.transfer()["ready"])
+        with self.assertRaisesRegex(m.MigrationError, "Cannot check Claude"):
+            self.engine.resume("t1")
+        self.assertFalse(self.tab_launches())
+
+    def test_hijacked_launch_is_reported_as_failed_and_can_be_retried(self):
+        self.imported()
+        self.runtime.hijack = True
+        with self.assertRaisesRegex(m.MigrationError, "did not start.*bsc rec"):
+            self.engine.resume("t1")
+        row = self.transfer()
+        self.assertEqual(row["status"], "failed")
+        self.assertTrue(row["ready"])
+        self.runtime.hijack = False
+        result = self.engine.resume("t1")
+        self.assertEqual(result["terminal"], "r2")
+        self.assertEqual(self.transfer()["status"], "resumed")
+
+    def test_agent_that_exits_at_once_is_reported_as_failed(self):
+        self.imported()
+        original = self.runtime.app
+        def exits(name, args):
+            result = original(name, args)
+            self.runtime.terminals[result["terminal"]]["foreground"] = {"name": "zsh", "argv": ["/bin/zsh", "-li"]}
+            return result
+        self.runtime.app = exits
+        with self.assertRaisesRegex(m.MigrationError, "did not start or keep running"):
+            self.engine.resume("t1")
+        self.assertEqual(self.transfer()["status"], "failed")
+
+    def test_late_start_after_failed_launch_is_adopted_not_launched_again(self):
+        self.imported()
+        self.runtime.hijack = True
+        with self.assertRaises(m.MigrationError):
+            self.engine.resume("t1")
+        # The agent appears in the failed tab after we stopped waiting.
+        self.runtime.terminals["r1"]["foreground"] = {"name": "2.1.316", "argv": ["claude", "--resume", "exact-conversation"]}
+        self.runtime.claude = [{"pid": 4242, "kind": "interactive", "sessionId": "exact-conversation"}]
+        self.assertEqual(self.transfer()["status"], "failed")
+        result = self.engine.resume("t1")
+        self.assertEqual((result["terminal"], result["tab"]), ("r1", "resume-tab-1"))
+        self.assertEqual(len(self.tab_launches()), 1)
+        self.assertEqual(self.transfer()["status"], "resumed")
 
     def test_live_session_in_another_pane_blocks_duplicate_resume(self):
         self.imported()
@@ -228,11 +331,9 @@ class MigrationTests(unittest.TestCase):
 
     def test_resume_uses_exact_argv_in_a_new_tab_and_prevents_second_launch(self):
         self.imported()
-        with patch.object(m.shutil, "which", return_value="/bin/claude"):
-            result = self.engine.resume("t1")
-        self.assertEqual(result["terminal"], "resumed")
-        call = next(args for name, args in self.runtime.calls if name == "tab.new")
-        self.assertEqual(call["argv"], ["claude", "--resume", "exact-conversation"])
+        result = self.engine.resume("t1")
+        self.assertEqual(result["terminal"], "r1")
+        self.assertEqual(self.tab_launches()[0]["argv"], ["claude", "--resume", "exact-conversation"])
         with self.assertRaisesRegex(m.MigrationError, "already been resumed"):
             self.engine.resume("t1")
 
